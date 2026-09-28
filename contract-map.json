@@ -1,0 +1,20 @@
+{
+  "about": "axe-core rule id -> plain-words contract clause. Loaded by uat_driver.cjs; override the file with UAT_CONTRACT_MAP. Any rule not listed here falls back to 'general accessibility (no contract clause mapped for this rule)'.",
+  "rules": {
+    "color-contrast": "contrast minimums (WCAG AA)",
+    "target-size": "44x44 CSS px minimum hit area",
+    "link-name": "every interactive element needs an accessible name",
+    "button-name": "every interactive element needs an accessible name",
+    "aria-command-name": "every interactive element needs an accessible name",
+    "image-alt": "images need an accessible name",
+    "label": "form fields need an accessible name/label",
+    "heading-order": "real heading hierarchy, no skipped levels",
+    "page-has-heading-one": "real heading hierarchy",
+    "landmark-one-main": "landmarks: header/navigation/main/complementary",
+    "region": "landmarks: header/navigation/main/complementary",
+    "landmark-unique": "landmarks must be identifiable",
+    "focus-order-semantics": "focus order follows semantic source order",
+    "aria-hidden-focus": "every function operable by keyboard",
+    "tabindex": "focus order"
+  }
+}

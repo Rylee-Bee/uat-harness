@@ -1,0 +1,11 @@
+node_modules/
+uat-out/
+runs/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Generated content index (agent-config). Regenerable; binary; contains
+# absolute home paths, so it must never reach a public repo.
+data/content.db
+**/data/content.db

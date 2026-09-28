@@ -1,0 +1,14 @@
+{
+  "name": "uat-harness",
+  "private": true,
+  "version": "0.1.0",
+  "description": "General-purpose real-browser UAT driver: real mouse clicks, real touch taps, real form typing, axe-core, traces and videos.",
+  "scripts": {
+    "uat": "node uat_driver.cjs",
+    "check": "node --check uat_driver.cjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "axe-core": "^4.13.0"
+  }
+}
