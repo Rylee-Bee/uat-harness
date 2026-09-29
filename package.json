@@ -7,7 +7,7 @@
     "uat": "node uat_driver.cjs",
     "check": "node --check uat_driver.cjs"
   },
-  "devDependencies": {
+  "dependencies": {
     "@playwright/test": "^1.63.0",
     "axe-core": "^4.13.0"
   }

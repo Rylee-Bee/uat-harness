@@ -44,7 +44,10 @@ function resolvePlaywright() {
     "  Tried:\n" + tried.map((t) => `    - ${t}`).join("\n") + "\n" +
     "  Fix one of:\n" +
     "    - set UAT_NODE_MODULES=/path/to/node_modules  (an existing install that contains @playwright/test), or\n" +
-    "    - run `npm install` in this repo (installs the devDependencies from package.json)."
+    "    - run `npm install` (this package declares @playwright/test and axe-core as dependencies,\n" +
+    "      so installing uat-harness brings them along).\n" +
+    "  Note: they are dependencies, not devDependencies, on purpose — npm does not install a\n" +
+    "  dependency's devDependencies, which is exactly how this fails."
   );
 }
 const { chromium, devices } = resolvePlaywright();
