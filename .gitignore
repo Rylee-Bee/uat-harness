@@ -9,3 +9,11 @@ __pycache__/
 # absolute home paths, so it must never reach a public repo.
 data/content.db
 **/data/content.db
+
+# Per-developer agent overrides (never shared)
+CLAUDE.local.md
+.claude/settings.local.json
+
+# Local env files (UAT_TOKEN is environment-only; this repo is public)
+.env
+.env.*
