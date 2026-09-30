@@ -44,7 +44,7 @@ UAT_NODE_MODULES=<existing node_modules with @playwright/test + axe-core> \
   python3 uat.py http://127.0.0.1:PORT/sample.html --out <dir under runs/ or outside the repo>
 ```
 
-Expect exit 0, `findings.json` + `report.md`, undersized targets flagged as `PROBLEM`, and
+Expect exit 0, `findings.json` + `report.md`, undersized targets flagged (`"level": "problem"` in `findings.json`, `PROBLEM` in `report.md`), and
 read-only notes (`would have sent: POST …`).
 
 ## Load-bearing rules
@@ -73,9 +73,12 @@ read-only notes (`would have sent: POST …`).
 
 ## Boundaries
 
-- **Consumers:** other estate frontends, via `ci-harness` (planned; no workflow references this
-  repo yet) or a direct package install. Changing CLI args, env var names, output file names or
-  the `findings.json` shape breaks consumers — update README and record the companion change.
+- **Consumers:** other estate frontends, by direct package install or through `ci-harness`'s
+  `reusable-uat.yml`. That workflow runs a caller-supplied command (it does not install this
+  repo), exports `UAT_READONLY`, `UAT_TOKEN` and `UAT_URL`, and uploads `uat-out/` by default.
+  This repo does not read `UAT_URL` (URLs are CLI args). Changing CLI args, env var names, the
+  `uat-out/` default, output file names or the `findings.json` shape breaks consumers: update
+  README and record the companion change for `ci-harness` rather than editing it from here.
 - **Duplicates elsewhere:** an older copy of `uat.py` / `uat_driver.cjs` lives in `hive-works`.
   Retiring it is that repo owner's call; do not edit it from here.
 - **Design brief:** the estate root's `docs/guides/agent-driven-uat.md` and decision
