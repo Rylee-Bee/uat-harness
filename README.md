@@ -5,7 +5,7 @@
 | **What** | A real-browser UAT driver: it clicks, taps and types for **real**, then reports what it found in plain words |
 | **Not** | A `locator.click()` smoke script — raw `page.mouse` move/down/up at each element's own coordinates, real `page.touchscreen.tap` on an iPhone-13 emulation, real `page.keyboard` typing into real forms |
 | **Also** | Two axe-core scans (desktop + mobile) mapped to contract clauses, full-page screenshots, Playwright traces and videos for both passes |
-| **Safety** | **Read-only by default** — every non-GET request is aborted in the browser and recorded as a finding |
+| **Safety** | **Read-only by default** — every non-GET HTTP request is aborted in the browser and recorded as a finding; service workers are blocked and WebSocket messages are dropped. Blocks HTTP methods/channels, **not** server mutation |
 | **Verdicts** | None, ever. Findings are `problem` / `note`; only an unreachable page exits non-zero |
 | **Parts** | `uat.py` (thin Python wrapper) + `uat_driver.cjs` (the Playwright work) |
 | **Deps** | `@playwright/test`, `axe-core` — declared in `package.json`, never vendored |
@@ -22,9 +22,11 @@ errors, failed requests, broken images), and what axe-core says about accessibil
 **This really clicks.** It clicks links, types into fields and submits forms on whatever URL you
 give it. Point it at a dev server or a built static site — never at a production form that emails
 someone, a live payment flow, or anything you can't afford to be clicked on for real. Read-only
-mode (`UAT_READONLY`, **on by default**) stops the *requests* those clicks cause from leaving the
-browser, but the clicks, typing and navigation are still real; `UAT_READONLY=0` removes the guard
-entirely, so only use that against a target you are allowed to mutate.
+mode (`UAT_READONLY`, **on by default**) stops the *non-GET HTTP requests* those
+clicks cause from leaving the browser (service workers are blocked and WebSocket
+messages are dropped), but the clicks, typing and navigation are still real; a `GET`
+with side effects still runs. `UAT_READONLY=0` removes the guard entirely, so only use
+that against a target you are allowed to mutate.
 
 ## Quickstart
 
@@ -41,8 +43,11 @@ python3 -m http.server PORT --directory fixtures
 python3 uat.py http://127.0.0.1:PORT/sample.html --out runs/smoke
 
 # Housekeeping
-npm run check            # syntax-check the driver
-node uat_driver.cjs URL OUTDIR   # driver directly, if you don't want the Python wrapper
+npm run check            # syntax-check the driver and lib/
+npm test                 # unit tests + Playwright fixtures (see "Tests")
+node uat_driver.cjs URL OUTDIR   # canonical safe entry point: the driver stages,
+                                 # redacts and finalizes its own artifacts even
+                                 # when the Python wrapper is not used
 ```
 
 If nothing resolves, the driver stops with the list of paths it tried and how to fix it
@@ -53,10 +58,12 @@ If nothing resolves, the driver stops with the list of paths it tried and how to
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `UAT_NODE_MODULES` | unset | Path to an existing `node_modules` containing `@playwright/test` and `axe-core`. Resolution order: this → `./node_modules` in this repo → bare `require`. |
-| `UAT_READONLY` | `1` (on) | `1`/unset: every non-GET request is aborted at the network layer and recorded as a `note` (`would have sent: POST /api/thing`); stated loudly in stderr and in the report header. `0`: real writes are allowed. |
+| `UAT_READONLY` | `1` (on) | `1`/unset: every non-GET HTTP request is aborted at the network layer and recorded as a `note` (`would have sent: POST /api/thing`); service workers are blocked and WebSocket messages are dropped. This blocks **HTTP methods/channels, not server mutation** — a GET endpoint with side effects still runs. Stated loudly in stderr and in the report header. `0`: real writes are allowed. |
 | `UAT_CONTRACT_MAP` | `./contract-map.json` | JSON file mapping axe rule ids → plain-words contract clauses. Unmapped rules fall back to `general accessibility (no contract clause mapped for this rule)`. An explicitly-set-but-broken path is a hard stop; a missing default file just degrades. |
-| `UAT_TOKEN` | unset | Optional bearer token for a walkthrough of a live, authenticated app, sent as `Authorization: Bearer …`. **Environment-only** — never written to a config, never echoed. Playwright traces *do* record request headers, so `uat.py` rewrites every artifact, **including the trace zips**, to redact it before the directory can be read or uploaded. Unset means the page is visited unauthenticated. |
+| `UAT_TOKEN` | unset | Optional bearer token for a walkthrough of a live, authenticated app, sent as `Authorization: Bearer …`. **Environment-only** — never written to a config, never echoed. The token is bound to an explicit scheme/host/port allowlist (see `UAT_AUTH_ORIGINS`): it is attached per-request only to the target origin, and is stripped from off-origin subresources and never sent on off-origin navigation. The driver redacts it from every artifact, **including the trace zips**, as part of finalization before the output directory is publishable. Unset means the page is visited unauthenticated. |
+| `UAT_AUTH_ORIGINS` | unset | Extra approved origins for `UAT_TOKEN`, comma-separated (e.g. `https://api.example.test:8443`). Only used when `UAT_TOKEN` is set. The target URL's own origin is always included; anything not listed gets no credential. A malformed entry is a hard stop. Redirects are followed hop-by-hop with the allowlist re-checked at each hop, so an authenticated request can never be redirected off the approved origins. |
 | `UAT_MAX_ELEMENTS` | `20` | Max interactive elements exercised per pass, per viewport. Exceeding it now reports **PARTIAL COVERAGE** explicitly instead of silently truncating. |
+| `UAT_TIMEOUT` | `420` | Seconds the Python wrapper waits for the driver before killing it and withholding its incomplete staging directory (fail closed). Raise for very content-heavy pages. |
 
 ## What it writes
 
@@ -72,6 +79,31 @@ All under the `--out` directory (default `./uat-out/<slug>-<timestamp>`):
 | `axe-desktop.json`, `axe-mobile.json` | Raw axe-core results |
 
 Artifacts live in `uat-out/` / `runs/` (both git-ignored) — never commit a run.
+
+**Finalization (E03):** the driver writes everything into a hidden
+`<out>/.staging/` directory first, redacts any bearer token from plain files
+**and from inside the trace ZIPs**, and only then promotes the artifacts to
+their real names. There is exactly one path that produces publishable
+artifacts and it always redacts; a scrub failure withholds the whole run
+(fail closed) and exits non-zero. A timed-out or crashed run leaves at most
+the hidden staging directory, which is not uploaded (and the Python wrapper
+removes it on timeout). Do not point an artifact uploader at `.staging/`.
+
+## Tests
+
+```sh
+npm run test:unit     # browser-free: origin-allowlist decisions, redaction, finalization
+npm run test:browser  # Playwright fixtures: E01 token scoping, E02 read-only policy, E03 redaction
+npm test              # both
+```
+
+The fixtures use obviously-fake canary tokens and disposable `127.0.0.1` servers only.
+E01 runs both a desktop and an iPhone-13 context and proves an off-origin resource,
+link, redirect hop and popup never receive the token while the approved origin still
+authenticates. E02 proves a mutating GET still runs, service workers are blocked, and a
+WebSocket write is dropped but recorded. E03 proves direct-driver, failed and timed-out
+runs leave no token in plain files or trace ZIP entries and publish nothing on a scrub
+failure. CI (`.github/workflows/ci.yml`) runs both suites on every push/PR.
 
 ## Where this fits
 

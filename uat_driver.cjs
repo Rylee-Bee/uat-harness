@@ -6,12 +6,19 @@
 // page.keyboard, and axe-core checks real WCAG rules, mapped to contract clauses via
 // contract-map.json (or $UAT_CONTRACT_MAP).
 //
-// Safety: read-only is ON by default (UAT_READONLY unset or 1). Every non-GET request is aborted at
-// the network layer and recorded as a finding ("would have sent: POST /api/thing") so the run can
-// never mutate anything behind the URL. Set UAT_READONLY=0 to allow real writes.
+// Safety: read-only is ON by default (UAT_READONLY unset or 1). Every non-GET
+// HTTP request is aborted at the network layer and recorded as a finding
+// ("would have sent: POST /api/thing"). Service workers are blocked and, in
+// read-only mode, WebSocket messages are captured and never forwarded. This
+// blocks HTTP *methods* (plus SW/WS channels); it does NOT prove the server
+// was protected from every mutation -- a GET endpoint with side effects still
+// runs. Set UAT_READONLY=0 to allow real writes.
 "use strict";
 const fs = require("fs");
 const path = require("path");
+const { buildAuthAllowlist, isApprovedOrigin, decideRequest, normalizeOrigin, safePath } = require("./lib/policy.cjs");
+const { installRequestPolicy, installWebSocketPolicy } = require("./lib/netpolicy.cjs");
+const { finalizeArtifacts, stageDirFor } = require("./lib/artifacts.cjs");
 
 // ---- Dependency resolution -------------------------------------------------------------------
 // This repo is standalone: no hardcoded sibling project's node_modules. Resolution order:
@@ -104,13 +111,21 @@ const MAX_ELEMENTS = (() => {
 const SETTLE_MS = 400;
 
 // Optional bearer token for a walkthrough of a live, authenticated app.
-// Deliberately environment-only: it is never written to disk, never echoed to
-// stderr, and never lands in findings.json, report.md, a trace or a video.
-// The caller decides whether to supply one; without it the driver simply
-// visits the page unauthenticated.
-const AUTH_HEADERS = process.env.UAT_TOKEN
-  ? { Authorization: `Bearer ${process.env.UAT_TOKEN}` }
-  : undefined;
+// Deliberately environment-only at rest. E01: it is NEVER put into context-wide
+// `extraHTTPHeaders` -- that applies to every request a page makes, so an
+// off-origin image, link, popup or redirect hop would receive it. Instead the
+// request policy (lib/netpolicy.cjs) attaches it per-request, and only for a
+// scheme/host/port in AUTH_ALLOWLIST. E03: Playwright traces DO record request
+// headers, so the driver redacts the token from every artifact -- inside trace
+// ZIPs too -- during finalization (lib/redact.cjs) BEFORE promotion into the
+// output directory; a scrub failure withholds the artifacts (fail closed).
+const AUTH_TOKEN = process.env.UAT_TOKEN || "";
+// The target origin plus any UAT_AUTH_ORIGINS entries. Empty when no token.
+let AUTH_ALLOWLIST = [];
+// E03: all artifacts are written to a hidden staging dir first and only
+// promoted into OUT_DIR after redaction by finalizeArtifacts().
+let OUT_DIR = null;
+let STAGE_DIR = null;
 const CLICK_SEL = "button, a[href], input[type=submit], input[type=button], [role=button]";
 
 // Blocked non-GET requests, in order. Each interaction snapshots the tail of this list so a blocked
@@ -122,27 +137,79 @@ const consumeBlocked = () => {
   blockedAttributed = blocked.length;
   return delta;
 };
-const fmtBlocks = (ds) => ds.map((b) => `${b.method} ${b.path}`).join(", ");
+const fmtBlocks = (ds) => ds.map((b) => b.kind === "websocket"
+  ? `WebSocket message (${b.bytes} bytes) to ${b.path}`
+  : `${b.method} ${b.path}${b.reason && !/read-only/.test(b.reason) ? ` [${b.reason}]` : ""}`).join(", ");
 
 function slug(s) {
   return String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60) || "el";
 }
 
-async function installReadOnly(ctx) {
-  if (!readOnly) return;
-  // Every non-GET dies here, at the network layer, before it can reach anything behind the URL.
-  await ctx.route("**/*", (route) => {
-    const req = route.request();
-    const method = String(req.method() || "GET").toUpperCase();
-    if (method === "GET") return route.continue();
-    let p = req.url();
-    try { p = new URL(req.url()).pathname; } catch (_) { /* keep the raw string */ }
-    blocked.push({ method, path: p });
-    process.stderr.write(`uat: READ-ONLY blocked: ${method} ${p}\n`);
-    // "aborted" -> net::ERR_ABORTED, which the requestfailed handler below deliberately ignores,
-    // so a blocked write is never double-reported as a network failure.
-    return route.abort("aborted");
+function recordBlock(b) {
+  blocked.push(b);
+  if (b.kind === "websocket") {
+    process.stderr.write(`uat: READ-ONLY blocked: WebSocket message (${b.bytes} bytes) to ${b.path} -- never forwarded\n`);
+    return;
+  }
+  const why = b.reason && !/read-only/.test(b.reason) ? ` [${b.reason}]` : "";
+  process.stderr.write(`uat: READ-ONLY blocked: ${b.method} ${b.path}${why}\n`);
+}
+
+// E01/E02: one context-level policy that (a) aborts non-GET methods in
+// read-only mode and (b) attaches the bearer token only to approved origins.
+// Replaces the old context-wide `extraHTTPHeaders` token and the old
+// non-GET-only route.
+async function installNetworkPolicy(ctx) {
+  const policy = await installRequestPolicy(ctx, {
+    allowlist: AUTH_ALLOWLIST,
+    token: AUTH_TOKEN,
+    readOnly,
+    onBlock: recordBlock,
   });
+  // E02: context routing does not see WebSocket traffic. In read-only mode the
+  // handshake is intercepted and never connected to the server, so page->server
+  // messages are recorded and dropped -- a write can never be forwarded.
+  await installWebSocketPolicy(ctx, { readOnly, onBlock: recordBlock });
+  return policy;
+}
+
+// E03: redact staging, then promote into OUT_DIR. Throws (after deleting
+// staging) on any failure so the caller can withhold everything.
+function finalize() {
+  if (!STAGE_DIR) return { scanned: 0, changed: 0 };
+  const stats = finalizeArtifacts(OUT_DIR, AUTH_TOKEN, { stageDir: STAGE_DIR });
+  STAGE_DIR = null;
+  return stats;
+}
+
+// The single exit point for every run. Finalizes artifacts (fail closed),
+// records the redaction result, and prints the machine-readable report.
+function emit(report, exitCode) {
+  let code = exitCode || 0;
+  try {
+    const stats = finalize();
+    if (report) report.redaction = Object.assign({ ok: true }, stats);
+  } catch (e) {
+    process.stderr.write(`uat: FINALIZATION FAILED -- artifacts withheld, nothing publishable was produced: ${firstLine(e)}\n`);
+    if (report) report.redaction = { ok: false, error: firstLine(e) };
+    code = 1;
+  }
+  if (report) {
+    // findings.json was staged and (on success) promoted; refresh it with the
+    // redaction record. If finalization failed, nothing was promoted.
+    try {
+      const p = path.join(OUT_DIR, "findings.json");
+      if (fs.existsSync(p)) fs.writeFileSync(p, JSON.stringify(report, null, 2));
+    } catch (_) { /* reporting best effort; never mask the run result */ }
+    console.log(JSON.stringify(report));
+  }
+  process.exitCode = code;
+}
+
+// Map a video's staging path to the name it will have after promotion.
+function reportVideoPath(pass, rawPath) {
+  if (!rawPath) return null;
+  return path.join(OUT_DIR, `video-${pass}`, path.basename(rawPath));
 }
 
 async function inventory(page, sel) {
@@ -171,6 +238,7 @@ async function domSignature(page) {
 
 function writeMarkdownReport(outDir, report) {
   const ro = report.readOnly || { on: false, blockedWrites: 0 };
+  const wsBlocked = (report.networkPolicy && report.networkPolicy.blockedWebSocketMessages) || 0;
   const cov = report.coverage || {};
   const problems = report.findings.filter((f) => f.level === "problem");
   const notes = report.findings.filter((f) => f.level === "note");
@@ -184,7 +252,7 @@ function writeMarkdownReport(outDir, report) {
   L.push(`| URL | ${report.url} |`);
   L.push(`| Run at | ${report.at} |`);
   L.push(ro.on
-    ? `| Read-only mode | **ON — every non-GET request was aborted in the browser and recorded below (${ro.blockedWrites} blocked). Nothing was written to the target.** |`
+    ? `| Read-only mode | **ON — blocked HTTP methods: ${ro.blockedWrites} non-GET request(s) aborted in the browser; service workers blocked; WebSocket messages dropped: ${wsBlocked}. This blocks the listed HTTP methods and channels — it does NOT prove the server was protected from mutation (a GET endpoint with side effects still runs).** |`
     : `| Read-only mode | **OFF (UAT_READONLY=0) — real writes were allowed and may have reached the target.** |`);
   L.push(`| Findings | ${problems.length} PROBLEM, ${notes.length} note |`);
   L.push(`| Real interactions | ${report.counts.mouseClicksTried} mouse clicks, ${report.counts.touchTapsTried} touch taps, ${report.counts.formsFilled} form(s) filled, ${report.counts.undersizedTargets} undersized (<44px) target(s) |`);
@@ -201,7 +269,7 @@ function writeMarkdownReport(outDir, report) {
   L.push("- **Not pass/fail.** Findings are never turned into a verdict; only an unreachable page makes the run exit non-zero. Read the findings, don't read the exit code.");
   L.push("- **State-change detection is a heuristic.** \"Did clicking this do anything\" compares the page URL and `document.body.innerHTML.length` before/after. It can false-positive \"did nothing\" on a same-page link that is *supposed* to do nothing, and it can miss a style-only change, an equal-length string change, or anything rendered in a canvas/shadow DOM.");
   L.push("- **Bounded coverage.** Only the first `UAT_MAX_ELEMENTS` visible interactive elements per pass, two viewports, and two axe scans. A clean run is not proof there is nothing left to find — open a trace or a screenshot before calling a page done.");
-  if (ro.on) L.push("- **Read-only mode proves nothing about the server side.** \"would have sent\" means the browser was stopped before the request left; no write path was exercised, no server response was validated.");
+  if (ro.on) L.push("- **Read-only mode blocks HTTP methods and channels, not mutations.** \"would have sent\" means the browser was stopped before the request left; a `GET` endpoint with side effects still runs, service workers are blocked (so their requests never happen), and WebSocket messages are dropped. No write path was exercised and no server response was validated.");
   L.push("- **Form results are not validated for correctness** — only whether something visibly changed after a real submit click.");
   L.push("");
   fs.writeFileSync(path.join(outDir, "report.md"), L.join("\n"));
@@ -213,10 +281,22 @@ async function main() {
     console.error("usage: node uat_driver.cjs <url> <outDir>");
     process.exit(2);
   }
-  fs.mkdirSync(outDir, { recursive: true });
+  // E01: bind the token to an explicit origin allowlist before any request is
+  // made. A bad UAT_AUTH_ORIGINS value is a hard stop -- never guess.
+  if (AUTH_TOKEN) {
+    try {
+      AUTH_ALLOWLIST = buildAuthAllowlist(url, process.env.UAT_AUTH_ORIGINS);
+    } catch (e) {
+      bail(`uat: ${firstLine(e)}`);
+    }
+  }
+  OUT_DIR = path.resolve(outDir);
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+  STAGE_DIR = stageDirFor(OUT_DIR);
+  fs.mkdirSync(STAGE_DIR, { recursive: true });
   process.stderr.write(
     readOnly
-      ? "uat: READ-ONLY MODE ON (UAT_READONLY unset/1) -- every non-GET request will be aborted and recorded as a finding\n"
+      ? "uat: READ-ONLY MODE ON (UAT_READONLY unset/1) -- every non-GET HTTP method will be blocked, service workers blocked, WebSocket messages dropped\n"
       : "uat: READ-ONLY MODE OFF (UAT_READONLY=0) -- real writes WILL be sent to the target\n",
   );
   if (!AXE_PATH) {
@@ -231,24 +311,23 @@ async function main() {
   try {
     browser = await chromium.launch();
   } catch (e) {
-    console.log(JSON.stringify({ url, ok: false, reason: `Could not launch Chromium: ${e.message}`, findings, counts }));
-    process.exitCode = 1;
-    return;
+    return emit({ url, ok: false, reason: `Could not launch Chromium: ${e.message}`, findings, counts }, 1);
   }
 
   // ---------------- Desktop pass: load, console/network, images, real mouse clicks, forms, axe --
-  const desktopVideoDir = path.join(outDir, "video-desktop");
+  const desktopVideoDir = path.join(STAGE_DIR, "video-desktop");
   fs.mkdirSync(desktopVideoDir, { recursive: true });
-  const desktopCtx = await browser.newContext({ viewport: { width: 1280, height: 900 }, recordVideo: { dir: desktopVideoDir }, ...(AUTH_HEADERS ? { extraHTTPHeaders: AUTH_HEADERS } : {}) });
-  await installReadOnly(desktopCtx);
+  const desktopCtx = await browser.newContext({ viewport: { width: 1280, height: 900 }, recordVideo: { dir: desktopVideoDir }, serviceWorkers: "block" });
+  const desktopPolicy = await installNetworkPolicy(desktopCtx);
   await desktopCtx.tracing.start({ screenshots: true, snapshots: true, sources: true });
   const page = await desktopCtx.newPage();
+  await desktopPolicy.attachPage(page);
   let where = "load";
   page.on("console", (m) => { if (m.type() === "error") add("problem", where, `Console error: ${m.text().slice(0, 300)}`); });
   page.on("pageerror", (e) => add("problem", where, `Page crashed: ${e.message.slice(0, 300)}`));
   page.on("requestfailed", (r) => {
     const f = r.failure()?.errorText || "";
-    if (/ERR_ABORTED/.test(f)) return; // includes our own read-only blocks — see installReadOnly()
+    if (/ERR_ABORTED/.test(f)) return; // includes our own read-only blocks — see installNetworkPolicy()
     add("problem", where, `Request failed: ${r.method()} ${r.url()} (${f})`);
   });
 
@@ -257,12 +336,10 @@ async function main() {
     resp = await page.goto(url, { waitUntil: "load", timeout: 20000 });
   } catch (e) {
     add("problem", "load", `Could not load ${url} at all: ${e.message.slice(0, 300)}`);
-    await desktopCtx.tracing.stop({ path: path.join(outDir, "trace-desktop.zip") }).catch(() => {});
+    await desktopCtx.tracing.stop({ path: path.join(STAGE_DIR, "trace-desktop.zip") }).catch(() => {});
     await desktopCtx.close();
     await browser.close();
-    console.log(JSON.stringify({ url, ok: false, reason: "page did not load", findings, counts }));
-    process.exitCode = 1;
-    return;
+    return emit({ url, ok: false, reason: "page did not load", findings, counts }, 1);
   }
   if (resp && !resp.ok()) add("problem", "load", `${url} answered HTTP ${resp.status()}`);
   await page.waitForTimeout(1000);
@@ -273,7 +350,7 @@ async function main() {
   );
   for (const src of brokenImgs) add("problem", "images", `Image failed to load: ${src}`);
 
-  await page.screenshot({ path: path.join(outDir, "desktop.png"), fullPage: true }).catch(() => {});
+  await page.screenshot({ path: path.join(STAGE_DIR, "desktop.png"), fullPage: true }).catch(() => {});
   process.stderr.write(`uat: loaded, screenshot taken\n`);
 
   // ---- Real mouse pass over buttons/links ----
@@ -440,7 +517,7 @@ async function main() {
       await page.waitForTimeout(400);
       await page.addScriptTag({ path: AXE_PATH });
       const results = await page.evaluate(async () => await window.axe.run());
-      fs.writeFileSync(path.join(outDir, "axe-desktop.json"), JSON.stringify(results, null, 2));
+      fs.writeFileSync(path.join(STAGE_DIR, "axe-desktop.json"), JSON.stringify(results, null, 2));
       for (const v of results.violations) {
         add(v.impact === "critical" || v.impact === "serious" ? "problem" : "note",
           `accessibility: ${v.id}`,
@@ -454,24 +531,25 @@ async function main() {
     add("note", where, "axe-core (axe.min.js) not resolvable -- accessibility scan skipped. Set UAT_NODE_MODULES or run `npm install`.");
   }
 
-  await desktopCtx.tracing.stop({ path: path.join(outDir, "trace-desktop.zip") }).catch(() => {});
-  const desktopVideoPath = await page.video()?.path().catch(() => null);
+  await desktopCtx.tracing.stop({ path: path.join(STAGE_DIR, "trace-desktop.zip") }).catch(() => {});
+  const desktopVideoPath = reportVideoPath("desktop", await page.video()?.path().catch(() => null));
   await desktopCtx.close();
   process.stderr.write(`uat: desktop pass done, starting mobile\n`);
 
   // ---------------- Mobile/touch pass -----------------------------------------------------------
   where = "interactive elements (touch)";
-  const mobileVideoDir = path.join(outDir, "video-mobile");
+  const mobileVideoDir = path.join(STAGE_DIR, "video-mobile");
   fs.mkdirSync(mobileVideoDir, { recursive: true });
-  const mobileCtx = await browser.newContext({ ...devices["iPhone 13"], recordVideo: { dir: mobileVideoDir }, ...(AUTH_HEADERS ? { extraHTTPHeaders: AUTH_HEADERS } : {}) });
-  await installReadOnly(mobileCtx);
+  const mobileCtx = await browser.newContext({ ...devices["iPhone 13"], recordVideo: { dir: mobileVideoDir }, serviceWorkers: "block" });
+  const mobilePolicy = await installNetworkPolicy(mobileCtx);
   await mobileCtx.tracing.start({ screenshots: true, snapshots: true, sources: true });
   const mpage = await mobileCtx.newPage();
+  await mobilePolicy.attachPage(mpage);
   mpage.on("console", (m) => { if (m.type() === "error") add("problem", where, `Console error (mobile): ${m.text().slice(0, 300)}`); });
   try {
     await mpage.goto(url, { waitUntil: "load", timeout: 20000 });
     await mpage.waitForTimeout(800);
-    await mpage.screenshot({ path: path.join(outDir, "mobile.png"), fullPage: true }).catch(() => {});
+    await mpage.screenshot({ path: path.join(STAGE_DIR, "mobile.png"), fullPage: true }).catch(() => {});
     const firstMobileCount = (await inventory(mpage, CLICK_SEL)).filter((e) => e.visible).length;
     const NM = Math.min(firstMobileCount, MAX_ELEMENTS);
     coverage.found = Math.max(coverage.found, firstMobileCount);
@@ -533,7 +611,7 @@ async function main() {
         await mpage.waitForTimeout(400);
         await mpage.addScriptTag({ path: AXE_PATH });
         const results = await mpage.evaluate(async () => await window.axe.run());
-        fs.writeFileSync(path.join(outDir, "axe-mobile.json"), JSON.stringify(results, null, 2));
+        fs.writeFileSync(path.join(STAGE_DIR, "axe-mobile.json"), JSON.stringify(results, null, 2));
         for (const v of results.violations) {
           add(v.impact === "critical" || v.impact === "serious" ? "problem" : "note",
             `accessibility (mobile): ${v.id}`,
@@ -547,32 +625,49 @@ async function main() {
   } catch (e) {
     add("problem", "mobile load", `Could not load ${url} on mobile emulation: ${e.message.slice(0, 300)}`);
   }
-  await mobileCtx.tracing.stop({ path: path.join(outDir, "trace-mobile.zip") }).catch(() => {});
-  const mobileVideoPath = await mpage.video()?.path().catch(() => null);
+  await mobileCtx.tracing.stop({ path: path.join(STAGE_DIR, "trace-mobile.zip") }).catch(() => {});
+  const mobileVideoPath = reportVideoPath("mobile", await mpage.video()?.path().catch(() => null));
   await mobileCtx.close();
   await browser.close();
 
   // Any write blocked outside a click/submit (background timers, autosave) still gets reported.
   for (const b of blocked.slice(blockedAttributed)) {
-    add("note", "network (read-only)", `request blocked by read-only mode, would have sent: ${b.method} ${b.path}`);
+    add("note", "network (read-only)", `blocked in the browser, would have sent: ${fmtBlocks([b])}`);
   }
   blockedAttributed = blocked.length;
 
+  const httpBlocked = blocked.filter((b) => b.kind !== "websocket").length;
+  const wsBlockedCount = blocked.filter((b) => b.kind === "websocket").length;
   const report = {
     url, ok: true, at: new Date().toISOString(),
-    readOnly: { on: readOnly, blockedWrites: blocked.length },
+    readOnly: { on: readOnly, blockedWrites: httpBlocked },
+    networkPolicy: {
+      readOnly,
+      authenticatedOriginsCount: AUTH_ALLOWLIST.length,
+      authScopedToAllowlist: AUTH_ALLOWLIST.length > 0,
+      serviceWorkers: "block",
+      blockedHttpMethods: httpBlocked,
+      blockedWebSocketMessages: wsBlockedCount,
+      note: "read-only blocks non-GET HTTP methods, blocks service workers, and drops WebSocket messages; it does not prevent mutations caused by GET side effects",
+    },
     findings, counts, coverage,
     screenshots: { desktop: "desktop.png", mobile: "mobile.png" },
     traces: { desktop: "trace-desktop.zip", mobile: "trace-mobile.zip" },
     videos: { desktop: desktopVideoPath, mobile: mobileVideoPath },
   };
-  fs.writeFileSync(path.join(outDir, "findings.json"), JSON.stringify(report, null, 2));
-  writeMarkdownReport(outDir, report);
-  console.log(JSON.stringify(report));
+  fs.writeFileSync(path.join(STAGE_DIR, "findings.json"), JSON.stringify(report, null, 2));
+  writeMarkdownReport(STAGE_DIR, report);
+  return emit(report, 0);
 }
 
-main().catch((e) => {
-  console.error("uat_driver fatal:", e);
-  console.log(JSON.stringify({ ok: false, reason: `fatal: ${e.message}`, findings: [], counts: {} }));
-  process.exitCode = 1;
-});
+// Pure decision helpers, re-exported so a unit test can require the driver (or
+// lib/policy.cjs directly) without launching a browser. Requiring this module
+// resolves the Playwright dependency but does not run a scan.
+module.exports = { isApprovedOrigin, buildAuthAllowlist, decideRequest, normalizeOrigin, safePath };
+
+if (require.main === module) {
+  main().catch((e) => {
+    console.error("uat_driver fatal:", e);
+    emit({ ok: false, reason: `fatal: ${e.message}`, findings: [], counts: {} }, 1);
+  });
+}
