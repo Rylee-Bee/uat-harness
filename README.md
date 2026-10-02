@@ -44,7 +44,9 @@ python3 uat.py http://127.0.0.1:PORT/sample.html --out runs/smoke
 
 # Housekeeping
 npm run check            # syntax-check the driver
-node uat_driver.cjs URL OUTDIR   # driver directly, if you don't want the Python wrapper
+node uat_driver.cjs URL OUTDIR   # canonical safe entry point: the driver stages,
+                                 # redacts and finalizes its own artifacts even
+                                 # when the Python wrapper is not used
 ```
 
 If nothing resolves, the driver stops with the list of paths it tried and how to fix it
@@ -60,6 +62,7 @@ If nothing resolves, the driver stops with the list of paths it tried and how to
 | `UAT_TOKEN` | unset | Optional bearer token for a walkthrough of a live, authenticated app, sent as `Authorization: Bearer …`. **Environment-only** — never written to a config, never echoed. The token is bound to an explicit scheme/host/port allowlist (see `UAT_AUTH_ORIGINS`): it is attached per-request only to the target origin, and is stripped from off-origin subresources and never sent on off-origin navigation. The driver redacts it from every artifact, **including the trace zips**, as part of finalization before the output directory is publishable. Unset means the page is visited unauthenticated. |
 | `UAT_AUTH_ORIGINS` | unset | Extra approved origins for `UAT_TOKEN`, comma-separated (e.g. `https://api.example.test:8443`). Only used when `UAT_TOKEN` is set. The target URL's own origin is always included; anything not listed gets no credential. A malformed entry is a hard stop. |
 | `UAT_MAX_ELEMENTS` | `20` | Max interactive elements exercised per pass, per viewport. Exceeding it now reports **PARTIAL COVERAGE** explicitly instead of silently truncating. |
+| `UAT_TIMEOUT` | `420` | Seconds the Python wrapper waits for the driver before killing it and withholding its incomplete staging directory (fail closed). Raise for very content-heavy pages. |
 
 ## What it writes
 
@@ -75,6 +78,15 @@ All under the `--out` directory (default `./uat-out/<slug>-<timestamp>`):
 | `axe-desktop.json`, `axe-mobile.json` | Raw axe-core results |
 
 Artifacts live in `uat-out/` / `runs/` (both git-ignored) — never commit a run.
+
+**Finalization (E03):** the driver writes everything into a hidden
+`<out>/.staging/` directory first, redacts any bearer token from plain files
+**and from inside the trace ZIPs**, and only then promotes the artifacts to
+their real names. There is exactly one path that produces publishable
+artifacts and it always redacts; a scrub failure withholds the whole run
+(fail closed) and exits non-zero. A timed-out or crashed run leaves at most
+the hidden staging directory, which is not uploaded (and the Python wrapper
+removes it on timeout). Do not point an artifact uploader at `.staging/`.
 
 ## Where this fits
 

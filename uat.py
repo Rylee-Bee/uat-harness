@@ -35,11 +35,15 @@ Configuration (environment variables; see README.md for the full table):
   UAT_CONTRACT_MAP   path to a JSON axe-rule -> contract-clause map
                      (otherwise ./contract-map.json next to the driver)
   UAT_MAX_ELEMENTS   max interactive elements exercised per pass per viewport (default 20)
+  UAT_TIMEOUT        seconds to wait for the driver before killing it and withholding
+                     its incomplete artifacts (default 420)
   UAT_TOKEN          optional bearer token for a live, authenticated app, sent as
                      `Authorization: Bearer ...`. Environment-only: never written to a
-                     config, never echoed. Playwright traces DO record request headers,
-                     so this wrapper rewrites every artifact (including the trace zips)
-                     to redact it before the directory can be read or uploaded.
+                     config, never echoed, and bound to an explicit origin allowlist.
+                     Playwright traces DO record request headers, so the DRIVER redacts
+                     the token from every artifact (inside the trace zips too) and
+                     finalizes them before promotion (fail closed); this wrapper
+                     withholds any leftover staging and re-scans as defence in depth.
 
 This is a thin Python wrapper (house style: absolute paths, quiet stops say why) around
 uat_driver.cjs, which does the actual Playwright work in Node -- there is no Python
@@ -82,15 +86,21 @@ BEARER_RE = re.compile(rb"(?i)bearer\s+[a-z0-9._~+/=-]{8,}")
 def redact_artifacts(out_dir: Path, secret: str) -> int:
     """Scrub a bearer credential out of every artifact under out_dir.
 
-    WHY THIS EXISTS (found by a canary test, not by inspection): Playwright
+    Belt-and-braces only: uat_driver.cjs now redacts its own staging tree
+    (including the trace zips) before promoting anything into out_dir, so the
+    canonical safe path has no token in it by the time this runs. This wrapper
+    keeps a second pass for defence in depth.
+
+    WHY REDACTION EXISTS (found by a canary test, not by inspection): Playwright
     tracing records request headers, so a token sent as `Authorization: Bearer
     ...` lands inside trace-*.zip -- specifically trace.network and trace.trace.
     Those zips are exactly what CI uploads as artifacts, and GitHub masks
-    secrets in logs but NOT in uploaded files. So the wrapper scrubs them
-    before anyone can read the directory.
+    secrets in logs but NOT in uploaded files.
 
-    Handles both plain files and zip entries (traces are zips). Returns the
-    number of files changed.
+    FAIL CLOSED: an unreadable file, corrupt zip or write failure raises
+    RuntimeError rather than being skipped -- if we cannot prove the directory
+    is token-free, the caller must withhold it. Returns the number of files
+    changed.
     """
     if not secret:
         return 0
@@ -108,26 +118,48 @@ def redact_artifacts(out_dir: Path, secret: str) -> int:
             try:
                 with zipfile.ZipFile(path) as zin:
                     entries = [(info, zin.read(info.filename)) for info in zin.infolist()]
-            except zipfile.BadZipFile:
-                continue
+            except (zipfile.BadZipFile, OSError) as e:
+                raise RuntimeError(f"cannot read zip {path.name}: {e}") from e
             changed = False
-            with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zout:
-                for info, data in entries:
-                    new = scrub(data)
-                    changed = changed or (new != data)
-                    zout.writestr(info, new)
+            try:
+                with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zout:
+                    for info, data in entries:
+                        new = scrub(data)
+                        changed = changed or (new != data)
+                        zout.writestr(info, new)
+            except OSError as e:
+                raise RuntimeError(f"cannot rewrite zip {path.name}: {e}") from e
             if changed:
                 touched += 1
         else:
             try:
                 data = path.read_bytes()
-            except OSError:
-                continue
+            except OSError as e:
+                raise RuntimeError(f"cannot read {path.name}: {e}") from e
             new = scrub(data)
             if new != data:
-                path.write_bytes(new)
+                try:
+                    path.write_bytes(new)
+                except OSError as e:
+                    raise RuntimeError(f"cannot write {path.name}: {e}") from e
                 touched += 1
     return touched
+
+
+def withhold_staging(out_dir: Path) -> int:
+    """Delete the driver's hidden staging directory (E03, fail closed).
+
+    The driver writes artifacts to `<out_dir>/.staging/` and only promotes them
+    after redaction. A timed-out or crashed driver can leave unredacted files
+    there; removing the whole directory guarantees an incomplete run contributes
+    nothing publishable. Returns the number of files removed.
+    """
+    stage = out_dir / ".staging"
+    if not stage.exists():
+        return 0
+    removed = sum(1 for p in stage.rglob("*") if p.is_file())
+    shutil.rmtree(stage, ignore_errors=True)
+    return removed
 
 
 def slug(url: str) -> str:
@@ -144,20 +176,42 @@ def run_one(url: str, out_dir: Path) -> int:
     if not DRIVER.exists():
         print(f"uat: driver missing at {DRIVER} -- was uat_driver.cjs deleted or moved?", file=sys.stderr)
         return 1
+    timeout_s = int(os.environ.get("UAT_TIMEOUT", "420") or "420")
     try:
-        proc = subprocess.run([node, str(DRIVER), url, str(out_dir)], capture_output=True, text=True, timeout=420)
+        proc = subprocess.run([node, str(DRIVER), url, str(out_dir)], capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired:
-        scrubbed = redact_artifacts(out_dir, os.environ.get("UAT_TOKEN", ""))
-        if scrubbed:
+        # E03 fail closed: a killed driver may have left unredacted files in
+        # .staging. Withhold the whole staging tree so an incomplete run
+        # contributes nothing publishable, then scrub promoted files too.
+        withheld = withhold_staging(out_dir)
+        try:
+            scrubbed = redact_artifacts(out_dir, os.environ.get("UAT_TOKEN", ""))
+        except RuntimeError as e:
+            scrubbed = 0
+            print(f"uat: {url}: redaction after timeout failed ({e}).", file=sys.stderr)
+        if withheld:
+            print(f"uat: {url}: withheld {withheld} staged file(s) from an incomplete run -- nothing publishable.", file=sys.stderr)
+        elif scrubbed:
             print(f"uat: redacted the bearer token from {scrubbed} artifact(s) after the timeout.", file=sys.stderr)
-        print(f"uat: {url}: driver did not finish within 420s -- a very content-heavy page (many "
+        print(f"uat: {url}: driver did not finish within {timeout_s}s -- a very content-heavy page (many "
               f"interactive elements, two full axe-core scans) can legitimately take 2-3 minutes; "
-              f"if this keeps happening, lower UAT_MAX_ELEMENTS (env, default 20) or check for a real hang.",
+              f"if this keeps happening, lower UAT_MAX_ELEMENTS (env, default 20), raise UAT_TIMEOUT, or "
+              f"check for a real hang.",
               file=sys.stderr)
         return 1
-    # Artifacts are complete now -- scrub any credential out of them before
-    # anything (including a CI artifact upload) can read this directory.
-    scrubbed = redact_artifacts(out_dir, os.environ.get("UAT_TOKEN", ""))
+    # The driver finalizes and redacts its own staging tree before promotion, so
+    # out_dir already holds token-free artifacts. This wrapper withholds any
+    # leftover staging from a crashed run and scrubs again as defence in depth.
+    # If redaction fails we cannot prove the directory is token-free: fail the run.
+    withheld = withhold_staging(out_dir)
+    if withheld:
+        print(f"uat: {url}: driver left {withheld} unfinished staged file(s); withheld them and failing the run.", file=sys.stderr)
+        return 1
+    try:
+        scrubbed = redact_artifacts(out_dir, os.environ.get("UAT_TOKEN", ""))
+    except RuntimeError as e:
+        print(f"uat: {url}: artifact redaction failed ({e}) -- refusing to treat the run as complete.", file=sys.stderr)
+        return 1
     stdout_lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
     if not stdout_lines:
         print(f"uat: {url}: driver produced no report -- stderr:\n{proc.stderr.strip()[-2000:]}", file=sys.stderr)
@@ -166,6 +220,14 @@ def run_one(url: str, out_dir: Path) -> int:
         report = json.loads(stdout_lines[-1])
     except json.JSONDecodeError:
         print(f"uat: {url}: driver output wasn't valid JSON -- stderr:\n{proc.stderr.strip()[-2000:]}", file=sys.stderr)
+        return 1
+
+    # E03 fail closed: if the driver could not redact/finalize, it prints the
+    # report but exits non-zero and promotes nothing. Refuse the run.
+    redaction = report.get("redaction") or {}
+    if redaction.get("ok") is False:
+        print(f"uat: {url}: artifact finalization failed ({redaction.get('error', 'unknown')}) -- "
+              f"nothing publishable was produced.", file=sys.stderr)
         return 1
 
     print(f"\n=== {url} ===")
@@ -191,8 +253,10 @@ def run_one(url: str, out_dir: Path) -> int:
     if coverage.get("partial"):
         print(f"  PARTIAL COVERAGE: {coverage.get('found', 0)} visible interactive elements found, only the first "
               f"{coverage.get('exercised', 0)} exercised per pass (raise UAT_MAX_ELEMENTS)")
-    if scrubbed:
-        print(f"  secrets: bearer token redacted from {scrubbed} artifact(s) -- including inside the trace zips")
+    driver_redacted = redaction.get("changed", 0)
+    if driver_redacted or scrubbed:
+        print(f"  secrets: bearer token redacted in-driver from {driver_redacted} artifact(s) before publish; "
+              f"wrapper re-scan changed {scrubbed}")
     print(f"  report: {out_dir / 'report.md'} , {out_dir / 'findings.json'}")
     print(f"  screenshots: {out_dir / 'desktop.png'} , {out_dir / 'mobile.png'}")
     print(f"  traces (open with `npx playwright show-trace <file>`): {out_dir / 'trace-desktop.zip'} , {out_dir / 'trace-mobile.zip'}")

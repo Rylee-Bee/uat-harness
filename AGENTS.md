@@ -13,8 +13,12 @@ here, don't fork it elsewhere.
 
 | Path | What | Open it? |
 | --- | --- | --- |
-| `uat_driver.cjs` | All Playwright work: dep resolution, inventory, real mouse/touch/typing, axe, report | yes, for any behaviour change |
-| `uat.py` | Thin wrapper: runs the driver, **redacts `UAT_TOKEN` from every artifact incl. trace zips**, prints summary | yes |
+| `uat_driver.cjs` | All Playwright work: dep resolution, inventory, real mouse/touch/typing, axe, report; stages artifacts, redacts tokens and finalizes (fail closed) | yes, for any behaviour change |
+| `lib/policy.cjs` | Pure origin-allowlist / request decision functions (no Playwright) | when changing credential or read-only policy |
+| `lib/netpolicy.cjs` | Playwright glue: per-request auth scoping, read-only block, WebSocket policy | when changing network policy |
+| `lib/redact.cjs` | In-driver artifact redaction (plain files + ZIP entries), fail closed | when changing redaction |
+| `lib/artifacts.cjs` | Hidden staging + redact-then-promote finalization | when changing artifact flow |
+| `uat.py` | Thin wrapper: runs the driver, withholds incomplete staging, re-scans as defence in depth, prints summary | yes |
 | `contract-map.json` | axe rule id → plain-words contract clause (override with `UAT_CONTRACT_MAP`) | when mapping rules |
 | `fixtures/sample.html` | The smoke-test page (undersized targets, POST button, form) | when changing the smoke test |
 | `contracts/{personas,journeys,acceptance}/` | Templates + one example each | docs work only |
@@ -57,9 +61,13 @@ read-only notes (`would have sent: POST …`).
    `page.goBack()`); re-run the element inventory fresh every iteration.** Lose any of these and
    every element after the first real navigation silently looks "dead" — the tool lying, not
    the site.
-3. **Keep `redact_artifacts()` in `uat.py`.** Playwright traces record request headers, so a
-   bearer token lands inside `trace-*.zip` — exactly what CI uploads. GitHub masks logs, not
-   uploaded files. Found by a canary test; load-bearing like rule 2.
+3. **Keep redaction inside the driver, before promotion.** `lib/redact.cjs` scrubs a
+   bearer token from plain files and from inside `trace-*.zip`; `lib/artifacts.cjs`
+   redacts the hidden `<out>/.staging/` tree and only then promotes it. Playwright
+   traces record request headers, so the token is exactly what CI would upload;
+   GitHub masks logs, not uploaded files. A scrub failure must withhold everything
+   (fail closed). `redact_artifacts()` in `uat.py` stays as defence in depth, not as
+   the primary guard. Found by a canary test; load-bearing like rule 2.
 4. **Findings are never pass/fail.** Only an unreachable page (or unresolvable deps) exits
    non-zero. Do not add a threshold that turns findings into an exit code.
 5. **Read-only stays the default** (`UAT_READONLY` unset/1 aborts every non-GET HTTP

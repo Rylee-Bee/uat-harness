@@ -18,6 +18,7 @@ const fs = require("fs");
 const path = require("path");
 const { buildAuthAllowlist, isApprovedOrigin, decideRequest, normalizeOrigin, safePath } = require("./lib/policy.cjs");
 const { installRequestPolicy, installWebSocketPolicy } = require("./lib/netpolicy.cjs");
+const { finalizeArtifacts, stageDirFor } = require("./lib/artifacts.cjs");
 
 // ---- Dependency resolution -------------------------------------------------------------------
 // This repo is standalone: no hardcoded sibling project's node_modules. Resolution order:
@@ -114,11 +115,17 @@ const SETTLE_MS = 400;
 // `extraHTTPHeaders` -- that applies to every request a page makes, so an
 // off-origin image, link, popup or redirect hop would receive it. Instead the
 // request policy (lib/netpolicy.cjs) attaches it per-request, and only for a
-// scheme/host/port in AUTH_ALLOWLIST. Artifact redaction is handled separately
-// by finalizeArtifacts() in lib/artifacts.cjs before anything is publishable.
+// scheme/host/port in AUTH_ALLOWLIST. E03: Playwright traces DO record request
+// headers, so the driver redacts the token from every artifact -- inside trace
+// ZIPs too -- during finalization (lib/redact.cjs) BEFORE promotion into the
+// output directory; a scrub failure withholds the artifacts (fail closed).
 const AUTH_TOKEN = process.env.UAT_TOKEN || "";
 // The target origin plus any UAT_AUTH_ORIGINS entries. Empty when no token.
 let AUTH_ALLOWLIST = [];
+// E03: all artifacts are written to a hidden staging dir first and only
+// promoted into OUT_DIR after redaction by finalizeArtifacts().
+let OUT_DIR = null;
+let STAGE_DIR = null;
 const CLICK_SEL = "button, a[href], input[type=submit], input[type=button], [role=button]";
 
 // Blocked non-GET requests, in order. Each interaction snapshots the tail of this list so a blocked
@@ -163,6 +170,45 @@ async function installNetworkPolicy(ctx) {
   // handshake is intercepted and never connected to the server, so page->server
   // messages are recorded and dropped -- a write can never be forwarded.
   await installWebSocketPolicy(ctx, { readOnly, onBlock: recordBlock });
+}
+
+// E03: redact staging, then promote into OUT_DIR. Throws (after deleting
+// staging) on any failure so the caller can withhold everything.
+function finalize() {
+  if (!STAGE_DIR) return { scanned: 0, changed: 0 };
+  const stats = finalizeArtifacts(OUT_DIR, AUTH_TOKEN, { stageDir: STAGE_DIR });
+  STAGE_DIR = null;
+  return stats;
+}
+
+// The single exit point for every run. Finalizes artifacts (fail closed),
+// records the redaction result, and prints the machine-readable report.
+function emit(report, exitCode) {
+  let code = exitCode || 0;
+  try {
+    const stats = finalize();
+    if (report) report.redaction = Object.assign({ ok: true }, stats);
+  } catch (e) {
+    process.stderr.write(`uat: FINALIZATION FAILED -- artifacts withheld, nothing publishable was produced: ${firstLine(e)}\n`);
+    if (report) report.redaction = { ok: false, error: firstLine(e) };
+    code = 1;
+  }
+  if (report) {
+    // findings.json was staged and (on success) promoted; refresh it with the
+    // redaction record. If finalization failed, nothing was promoted.
+    try {
+      const p = path.join(OUT_DIR, "findings.json");
+      if (fs.existsSync(p)) fs.writeFileSync(p, JSON.stringify(report, null, 2));
+    } catch (_) { /* reporting best effort; never mask the run result */ }
+    console.log(JSON.stringify(report));
+  }
+  process.exitCode = code;
+}
+
+// Map a video's staging path to the name it will have after promotion.
+function reportVideoPath(pass, rawPath) {
+  if (!rawPath) return null;
+  return path.join(OUT_DIR, `video-${pass}`, path.basename(rawPath));
 }
 
 async function inventory(page, sel) {
@@ -243,10 +289,13 @@ async function main() {
       bail(`uat: ${firstLine(e)}`);
     }
   }
-  fs.mkdirSync(outDir, { recursive: true });
+  OUT_DIR = path.resolve(outDir);
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+  STAGE_DIR = stageDirFor(OUT_DIR);
+  fs.mkdirSync(STAGE_DIR, { recursive: true });
   process.stderr.write(
     readOnly
-      ? "uat: READ-ONLY MODE ON (UAT_READONLY unset/1) -- every non-GET request will be aborted and recorded as a finding\n"
+      ? "uat: READ-ONLY MODE ON (UAT_READONLY unset/1) -- every non-GET HTTP method will be blocked, service workers blocked, WebSocket messages dropped\n"
       : "uat: READ-ONLY MODE OFF (UAT_READONLY=0) -- real writes WILL be sent to the target\n",
   );
   if (!AXE_PATH) {
@@ -261,13 +310,11 @@ async function main() {
   try {
     browser = await chromium.launch();
   } catch (e) {
-    console.log(JSON.stringify({ url, ok: false, reason: `Could not launch Chromium: ${e.message}`, findings, counts }));
-    process.exitCode = 1;
-    return;
+    return emit({ url, ok: false, reason: `Could not launch Chromium: ${e.message}`, findings, counts }, 1);
   }
 
   // ---------------- Desktop pass: load, console/network, images, real mouse clicks, forms, axe --
-  const desktopVideoDir = path.join(outDir, "video-desktop");
+  const desktopVideoDir = path.join(STAGE_DIR, "video-desktop");
   fs.mkdirSync(desktopVideoDir, { recursive: true });
   const desktopCtx = await browser.newContext({ viewport: { width: 1280, height: 900 }, recordVideo: { dir: desktopVideoDir }, serviceWorkers: "block" });
   await installNetworkPolicy(desktopCtx);
@@ -287,12 +334,10 @@ async function main() {
     resp = await page.goto(url, { waitUntil: "load", timeout: 20000 });
   } catch (e) {
     add("problem", "load", `Could not load ${url} at all: ${e.message.slice(0, 300)}`);
-    await desktopCtx.tracing.stop({ path: path.join(outDir, "trace-desktop.zip") }).catch(() => {});
+    await desktopCtx.tracing.stop({ path: path.join(STAGE_DIR, "trace-desktop.zip") }).catch(() => {});
     await desktopCtx.close();
     await browser.close();
-    console.log(JSON.stringify({ url, ok: false, reason: "page did not load", findings, counts }));
-    process.exitCode = 1;
-    return;
+    return emit({ url, ok: false, reason: "page did not load", findings, counts }, 1);
   }
   if (resp && !resp.ok()) add("problem", "load", `${url} answered HTTP ${resp.status()}`);
   await page.waitForTimeout(1000);
@@ -303,7 +348,7 @@ async function main() {
   );
   for (const src of brokenImgs) add("problem", "images", `Image failed to load: ${src}`);
 
-  await page.screenshot({ path: path.join(outDir, "desktop.png"), fullPage: true }).catch(() => {});
+  await page.screenshot({ path: path.join(STAGE_DIR, "desktop.png"), fullPage: true }).catch(() => {});
   process.stderr.write(`uat: loaded, screenshot taken\n`);
 
   // ---- Real mouse pass over buttons/links ----
@@ -470,7 +515,7 @@ async function main() {
       await page.waitForTimeout(400);
       await page.addScriptTag({ path: AXE_PATH });
       const results = await page.evaluate(async () => await window.axe.run());
-      fs.writeFileSync(path.join(outDir, "axe-desktop.json"), JSON.stringify(results, null, 2));
+      fs.writeFileSync(path.join(STAGE_DIR, "axe-desktop.json"), JSON.stringify(results, null, 2));
       for (const v of results.violations) {
         add(v.impact === "critical" || v.impact === "serious" ? "problem" : "note",
           `accessibility: ${v.id}`,
@@ -484,14 +529,14 @@ async function main() {
     add("note", where, "axe-core (axe.min.js) not resolvable -- accessibility scan skipped. Set UAT_NODE_MODULES or run `npm install`.");
   }
 
-  await desktopCtx.tracing.stop({ path: path.join(outDir, "trace-desktop.zip") }).catch(() => {});
-  const desktopVideoPath = await page.video()?.path().catch(() => null);
+  await desktopCtx.tracing.stop({ path: path.join(STAGE_DIR, "trace-desktop.zip") }).catch(() => {});
+  const desktopVideoPath = reportVideoPath("desktop", await page.video()?.path().catch(() => null));
   await desktopCtx.close();
   process.stderr.write(`uat: desktop pass done, starting mobile\n`);
 
   // ---------------- Mobile/touch pass -----------------------------------------------------------
   where = "interactive elements (touch)";
-  const mobileVideoDir = path.join(outDir, "video-mobile");
+  const mobileVideoDir = path.join(STAGE_DIR, "video-mobile");
   fs.mkdirSync(mobileVideoDir, { recursive: true });
   const mobileCtx = await browser.newContext({ ...devices["iPhone 13"], recordVideo: { dir: mobileVideoDir }, serviceWorkers: "block" });
   await installNetworkPolicy(mobileCtx);
@@ -501,7 +546,7 @@ async function main() {
   try {
     await mpage.goto(url, { waitUntil: "load", timeout: 20000 });
     await mpage.waitForTimeout(800);
-    await mpage.screenshot({ path: path.join(outDir, "mobile.png"), fullPage: true }).catch(() => {});
+    await mpage.screenshot({ path: path.join(STAGE_DIR, "mobile.png"), fullPage: true }).catch(() => {});
     const firstMobileCount = (await inventory(mpage, CLICK_SEL)).filter((e) => e.visible).length;
     const NM = Math.min(firstMobileCount, MAX_ELEMENTS);
     coverage.found = Math.max(coverage.found, firstMobileCount);
@@ -563,7 +608,7 @@ async function main() {
         await mpage.waitForTimeout(400);
         await mpage.addScriptTag({ path: AXE_PATH });
         const results = await mpage.evaluate(async () => await window.axe.run());
-        fs.writeFileSync(path.join(outDir, "axe-mobile.json"), JSON.stringify(results, null, 2));
+        fs.writeFileSync(path.join(STAGE_DIR, "axe-mobile.json"), JSON.stringify(results, null, 2));
         for (const v of results.violations) {
           add(v.impact === "critical" || v.impact === "serious" ? "problem" : "note",
             `accessibility (mobile): ${v.id}`,
@@ -577,8 +622,8 @@ async function main() {
   } catch (e) {
     add("problem", "mobile load", `Could not load ${url} on mobile emulation: ${e.message.slice(0, 300)}`);
   }
-  await mobileCtx.tracing.stop({ path: path.join(outDir, "trace-mobile.zip") }).catch(() => {});
-  const mobileVideoPath = await mpage.video()?.path().catch(() => null);
+  await mobileCtx.tracing.stop({ path: path.join(STAGE_DIR, "trace-mobile.zip") }).catch(() => {});
+  const mobileVideoPath = reportVideoPath("mobile", await mpage.video()?.path().catch(() => null));
   await mobileCtx.close();
   await browser.close();
 
@@ -607,9 +652,9 @@ async function main() {
     traces: { desktop: "trace-desktop.zip", mobile: "trace-mobile.zip" },
     videos: { desktop: desktopVideoPath, mobile: mobileVideoPath },
   };
-  fs.writeFileSync(path.join(outDir, "findings.json"), JSON.stringify(report, null, 2));
-  writeMarkdownReport(outDir, report);
-  console.log(JSON.stringify(report));
+  fs.writeFileSync(path.join(STAGE_DIR, "findings.json"), JSON.stringify(report, null, 2));
+  writeMarkdownReport(STAGE_DIR, report);
+  return emit(report, 0);
 }
 
 // Pure decision helpers, re-exported so a unit test can require the driver (or
@@ -620,7 +665,6 @@ module.exports = { isApprovedOrigin, buildAuthAllowlist, decideRequest, normaliz
 if (require.main === module) {
   main().catch((e) => {
     console.error("uat_driver fatal:", e);
-    console.log(JSON.stringify({ ok: false, reason: `fatal: ${e.message}`, findings: [], counts: {} }));
-    process.exitCode = 1;
+    emit({ ok: false, reason: `fatal: ${e.message}`, findings: [], counts: {} }, 1);
   });
 }
