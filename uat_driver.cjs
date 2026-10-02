@@ -12,6 +12,8 @@
 "use strict";
 const fs = require("fs");
 const path = require("path");
+const { buildAuthAllowlist, isApprovedOrigin, decideRequest, normalizeOrigin, safePath } = require("./lib/policy.cjs");
+const { installRequestPolicy } = require("./lib/netpolicy.cjs");
 
 // ---- Dependency resolution -------------------------------------------------------------------
 // This repo is standalone: no hardcoded sibling project's node_modules. Resolution order:
@@ -104,13 +106,15 @@ const MAX_ELEMENTS = (() => {
 const SETTLE_MS = 400;
 
 // Optional bearer token for a walkthrough of a live, authenticated app.
-// Deliberately environment-only: it is never written to disk, never echoed to
-// stderr, and never lands in findings.json, report.md, a trace or a video.
-// The caller decides whether to supply one; without it the driver simply
-// visits the page unauthenticated.
-const AUTH_HEADERS = process.env.UAT_TOKEN
-  ? { Authorization: `Bearer ${process.env.UAT_TOKEN}` }
-  : undefined;
+// Deliberately environment-only at rest. E01: it is NEVER put into context-wide
+// `extraHTTPHeaders` -- that applies to every request a page makes, so an
+// off-origin image, link, popup or redirect hop would receive it. Instead the
+// request policy (lib/netpolicy.cjs) attaches it per-request, and only for a
+// scheme/host/port in AUTH_ALLOWLIST. Artifact redaction is handled separately
+// by finalizeArtifacts() in lib/artifacts.cjs before anything is publishable.
+const AUTH_TOKEN = process.env.UAT_TOKEN || "";
+// The target origin plus any UAT_AUTH_ORIGINS entries. Empty when no token.
+let AUTH_ALLOWLIST = [];
 const CLICK_SEL = "button, a[href], input[type=submit], input[type=button], [role=button]";
 
 // Blocked non-GET requests, in order. Each interaction snapshots the tail of this list so a blocked
@@ -128,20 +132,26 @@ function slug(s) {
   return String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60) || "el";
 }
 
-async function installReadOnly(ctx) {
-  if (!readOnly) return;
-  // Every non-GET dies here, at the network layer, before it can reach anything behind the URL.
-  await ctx.route("**/*", (route) => {
-    const req = route.request();
-    const method = String(req.method() || "GET").toUpperCase();
-    if (method === "GET") return route.continue();
-    let p = req.url();
-    try { p = new URL(req.url()).pathname; } catch (_) { /* keep the raw string */ }
-    blocked.push({ method, path: p });
-    process.stderr.write(`uat: READ-ONLY blocked: ${method} ${p}\n`);
-    // "aborted" -> net::ERR_ABORTED, which the requestfailed handler below deliberately ignores,
-    // so a blocked write is never double-reported as a network failure.
-    return route.abort("aborted");
+function recordBlock(b) {
+  blocked.push(b);
+  if (b.kind === "websocket") {
+    process.stderr.write(`uat: READ-ONLY blocked: WebSocket message (${b.bytes} bytes) to ${b.path} -- never forwarded\n`);
+    return;
+  }
+  const why = b.reason && !/read-only/.test(b.reason) ? ` [${b.reason}]` : "";
+  process.stderr.write(`uat: READ-ONLY blocked: ${b.method} ${b.path}${why}\n`);
+}
+
+// E01/E02: one context-level policy that (a) aborts non-GET methods in
+// read-only mode and (b) attaches the bearer token only to approved origins.
+// Replaces the old context-wide `extraHTTPHeaders` token and the old
+// non-GET-only route.
+async function installNetworkPolicy(ctx) {
+  await installRequestPolicy(ctx, {
+    allowlist: AUTH_ALLOWLIST,
+    token: AUTH_TOKEN,
+    readOnly,
+    onBlock: recordBlock,
   });
 }
 
@@ -213,6 +223,15 @@ async function main() {
     console.error("usage: node uat_driver.cjs <url> <outDir>");
     process.exit(2);
   }
+  // E01: bind the token to an explicit origin allowlist before any request is
+  // made. A bad UAT_AUTH_ORIGINS value is a hard stop -- never guess.
+  if (AUTH_TOKEN) {
+    try {
+      AUTH_ALLOWLIST = buildAuthAllowlist(url, process.env.UAT_AUTH_ORIGINS);
+    } catch (e) {
+      bail(`uat: ${firstLine(e)}`);
+    }
+  }
   fs.mkdirSync(outDir, { recursive: true });
   process.stderr.write(
     readOnly
@@ -239,8 +258,8 @@ async function main() {
   // ---------------- Desktop pass: load, console/network, images, real mouse clicks, forms, axe --
   const desktopVideoDir = path.join(outDir, "video-desktop");
   fs.mkdirSync(desktopVideoDir, { recursive: true });
-  const desktopCtx = await browser.newContext({ viewport: { width: 1280, height: 900 }, recordVideo: { dir: desktopVideoDir }, ...(AUTH_HEADERS ? { extraHTTPHeaders: AUTH_HEADERS } : {}) });
-  await installReadOnly(desktopCtx);
+  const desktopCtx = await browser.newContext({ viewport: { width: 1280, height: 900 }, recordVideo: { dir: desktopVideoDir } });
+  await installNetworkPolicy(desktopCtx);
   await desktopCtx.tracing.start({ screenshots: true, snapshots: true, sources: true });
   const page = await desktopCtx.newPage();
   let where = "load";
@@ -248,7 +267,7 @@ async function main() {
   page.on("pageerror", (e) => add("problem", where, `Page crashed: ${e.message.slice(0, 300)}`));
   page.on("requestfailed", (r) => {
     const f = r.failure()?.errorText || "";
-    if (/ERR_ABORTED/.test(f)) return; // includes our own read-only blocks — see installReadOnly()
+    if (/ERR_ABORTED/.test(f)) return; // includes our own read-only blocks — see installNetworkPolicy()
     add("problem", where, `Request failed: ${r.method()} ${r.url()} (${f})`);
   });
 
@@ -463,8 +482,8 @@ async function main() {
   where = "interactive elements (touch)";
   const mobileVideoDir = path.join(outDir, "video-mobile");
   fs.mkdirSync(mobileVideoDir, { recursive: true });
-  const mobileCtx = await browser.newContext({ ...devices["iPhone 13"], recordVideo: { dir: mobileVideoDir }, ...(AUTH_HEADERS ? { extraHTTPHeaders: AUTH_HEADERS } : {}) });
-  await installReadOnly(mobileCtx);
+  const mobileCtx = await browser.newContext({ ...devices["iPhone 13"], recordVideo: { dir: mobileVideoDir } });
+  await installNetworkPolicy(mobileCtx);
   await mobileCtx.tracing.start({ screenshots: true, snapshots: true, sources: true });
   const mpage = await mobileCtx.newPage();
   mpage.on("console", (m) => { if (m.type() === "error") add("problem", where, `Console error (mobile): ${m.text().slice(0, 300)}`); });
@@ -571,8 +590,15 @@ async function main() {
   console.log(JSON.stringify(report));
 }
 
-main().catch((e) => {
-  console.error("uat_driver fatal:", e);
-  console.log(JSON.stringify({ ok: false, reason: `fatal: ${e.message}`, findings: [], counts: {} }));
-  process.exitCode = 1;
-});
+// Pure decision helpers, re-exported so a unit test can require the driver (or
+// lib/policy.cjs directly) without launching a browser. Requiring this module
+// resolves the Playwright dependency but does not run a scan.
+module.exports = { isApprovedOrigin, buildAuthAllowlist, decideRequest, normalizeOrigin, safePath };
+
+if (require.main === module) {
+  main().catch((e) => {
+    console.error("uat_driver fatal:", e);
+    console.log(JSON.stringify({ ok: false, reason: `fatal: ${e.message}`, findings: [], counts: {} }));
+    process.exitCode = 1;
+  });
+}

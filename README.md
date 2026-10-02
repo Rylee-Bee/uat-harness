@@ -5,7 +5,7 @@
 | **What** | A real-browser UAT driver: it clicks, taps and types for **real**, then reports what it found in plain words |
 | **Not** | A `locator.click()` smoke script — raw `page.mouse` move/down/up at each element's own coordinates, real `page.touchscreen.tap` on an iPhone-13 emulation, real `page.keyboard` typing into real forms |
 | **Also** | Two axe-core scans (desktop + mobile) mapped to contract clauses, full-page screenshots, Playwright traces and videos for both passes |
-| **Safety** | **Read-only by default** — every non-GET request is aborted in the browser and recorded as a finding |
+| **Safety** | **Read-only by default** — every non-GET HTTP request is aborted in the browser and recorded as a finding; the bearer token is scoped to an explicit origin allowlist |
 | **Verdicts** | None, ever. Findings are `problem` / `note`; only an unreachable page exits non-zero |
 | **Parts** | `uat.py` (thin Python wrapper) + `uat_driver.cjs` (the Playwright work) |
 | **Deps** | `@playwright/test`, `axe-core` — declared in `package.json`, never vendored |
@@ -55,7 +55,8 @@ If nothing resolves, the driver stops with the list of paths it tried and how to
 | `UAT_NODE_MODULES` | unset | Path to an existing `node_modules` containing `@playwright/test` and `axe-core`. Resolution order: this → `./node_modules` in this repo → bare `require`. |
 | `UAT_READONLY` | `1` (on) | `1`/unset: every non-GET request is aborted at the network layer and recorded as a `note` (`would have sent: POST /api/thing`); stated loudly in stderr and in the report header. `0`: real writes are allowed. |
 | `UAT_CONTRACT_MAP` | `./contract-map.json` | JSON file mapping axe rule ids → plain-words contract clauses. Unmapped rules fall back to `general accessibility (no contract clause mapped for this rule)`. An explicitly-set-but-broken path is a hard stop; a missing default file just degrades. |
-| `UAT_TOKEN` | unset | Optional bearer token for a walkthrough of a live, authenticated app, sent as `Authorization: Bearer …`. **Environment-only** — never written to a config, never echoed. Playwright traces *do* record request headers, so `uat.py` rewrites every artifact, **including the trace zips**, to redact it before the directory can be read or uploaded. Unset means the page is visited unauthenticated. |
+| `UAT_TOKEN` | unset | Optional bearer token for a walkthrough of a live, authenticated app, sent as `Authorization: Bearer …`. **Environment-only** — never written to a config, never echoed. The token is bound to an explicit scheme/host/port allowlist (see `UAT_AUTH_ORIGINS`): it is attached per-request only to the target origin, and is stripped from off-origin subresources and never sent on off-origin navigation. The driver redacts it from every artifact, **including the trace zips**, as part of finalization before the output directory is publishable. Unset means the page is visited unauthenticated. |
+| `UAT_AUTH_ORIGINS` | unset | Extra approved origins for `UAT_TOKEN`, comma-separated (e.g. `https://api.example.test:8443`). Only used when `UAT_TOKEN` is set. The target URL's own origin is always included; anything not listed gets no credential. A malformed entry is a hard stop. |
 | `UAT_MAX_ELEMENTS` | `20` | Max interactive elements exercised per pass, per viewport. Exceeding it now reports **PARTIAL COVERAGE** explicitly instead of silently truncating. |
 
 ## What it writes
