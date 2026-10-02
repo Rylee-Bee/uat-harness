@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@playwright/test": "^1.63.0",
+    "adm-zip": "^0.6.1",
     "axe-core": "^4.13.0"
   }
 }
