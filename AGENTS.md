@@ -22,18 +22,25 @@ here, don't fork it elsewhere.
 | `contract-map.json` | axe rule id → plain-words contract clause (override with `UAT_CONTRACT_MAP`) | when mapping rules |
 | `fixtures/sample.html` | The smoke-test page (undersized targets, POST button, form) | when changing the smoke test |
 | `contracts/{personas,journeys,acceptance}/` | Templates + one example each | docs work only |
-| `package.json` | Scripts `uat`, `check`; deps | rarely |
+| `package.json` | Scripts `uat`, `check`, `test:unit`, `test:browser`, `test`; deps | rarely |
+| `tests/unit/*.test.cjs` | Browser-free unit tests for `lib/policy.cjs`, `lib/redact.cjs`, `lib/artifacts.cjs` | when changing those decisions |
+| `tests/*.spec.cjs` | Playwright acceptance fixtures for E01/E02/E03 (canary tokens only) | when changing the guarantees |
+| `.github/workflows/ci.yml` | CI: unit tests + Playwright fixtures on chromium | when changing what CI proves |
 | `README.md` | User docs: env vars, outputs, where this fits | keep in sync with behaviour |
-| `uat-out/`, `runs/` | Run output (gitignored): screenshots, traces, videos, reports | to review a run; never commit |
+| `uat-out/`, `runs/`, `playwright-report/` | Run output (gitignored): screenshots, traces, videos, reports | to review a run; never commit |
 
-No tests, no CI workflow and no lockfile exist in this repo today.
+Tests, a committed lockfile and a CI workflow now exist. `npm test` runs the unit
+tests then the browser fixtures; no test skips silently.
 
 ## Commands
 
 | Command | Defined in | Notes |
 | --- | --- | --- |
-| `npm run check` | `package.json` | `node --check uat_driver.cjs` — syntax only, **not** the smoke test |
-| `npm run uat -- URL OUTDIR` | `package.json` | driver directly, skips the redaction wrapper |
+| `npm run check` | `package.json` | `node --check` on the driver and every `lib/*.cjs` — syntax only, **not** the tests |
+| `npm run test:unit` | `package.json` | `node --test tests/unit` — browser-free policy/redaction tests |
+| `npm run test:browser` | `package.json` | `playwright test` — E01/E02/E03 fixtures (chromium) |
+| `npm test` | `package.json` | unit tests then browser fixtures |
+| `npm run uat -- URL OUTDIR` | `package.json` | canonical safe driver; stages + redacts even without the wrapper |
 | `python3 uat.py URL [URL…] [--out DIR]` | `uat.py` | normal entry point; default out `./uat-out/<slug>-<ts>` |
 | `npm install && npx playwright install chromium` | README | only if not reusing an install via `UAT_NODE_MODULES` |
 
@@ -80,6 +87,12 @@ read-only notes (`would have sent: POST …`).
 7. **Public-safe tracked files.** No secrets, tokens, hostnames, real ports, LAN IPs, deployment
    topology, or absolute machine paths. Examples use `http://127.0.0.1:PORT/...` literally;
    document environment variables instead of paths. Never commit a run directory.
+8. **Authenticated requests are policed via CDP `Fetch`, not `context.route`.** Playwright's
+   route handler is NOT invoked for redirect hops (measured: a 302 to an off-origin host
+   followed with the Authorization header still attached). `lib/netpolicy.cjs` uses a raw CDP
+   `Fetch.requestPaused` session so the allowlist is re-checked at every hop, and an
+   off-allowlist hop is failed rather than followed. This is Chromium-only (the driver's
+   browser); await the returned `attachPage(page)` before a page's first navigation.
 
 ## Boundaries
 

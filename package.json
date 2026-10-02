@@ -5,7 +5,10 @@
   "description": "General-purpose real-browser UAT driver: real mouse clicks, real touch taps, real form typing, axe-core, traces and videos.",
   "scripts": {
     "uat": "node uat_driver.cjs",
-    "check": "node --check uat_driver.cjs"
+    "check": "node --check uat_driver.cjs && node --check lib/policy.cjs && node --check lib/netpolicy.cjs && node --check lib/redact.cjs && node --check lib/artifacts.cjs",
+    "test:unit": "node --test tests/unit/*.test.cjs",
+    "test:browser": "playwright test",
+    "test": "npm run test:unit && npm run test:browser"
   },
   "dependencies": {
     "@playwright/test": "^1.63.0",

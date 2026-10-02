@@ -4,6 +4,8 @@ runs/
 __pycache__/
 *.pyc
 .DS_Store
+playwright-report/
+test-results/
 
 # Generated content index (agent-config). Regenerable; binary; contains
 # absolute home paths, so it must never reach a public repo.
