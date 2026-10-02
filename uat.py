@@ -26,9 +26,12 @@ For every URL it loads the real page in headless Chromium and:
 Configuration (environment variables; see README.md for the full table):
   UAT_NODE_MODULES   path to an existing node_modules with @playwright/test + axe-core
                      (otherwise ./node_modules in this repo, otherwise a bare require)
-  UAT_READONLY       unset or 1 (default) = read-only: every non-GET request is aborted
-                     in the browser and recorded as a finding ("would have sent: POST
-                     /api/thing"); 0 = real writes are allowed
+  UAT_READONLY       unset or 1 (default) = read-only: every non-GET HTTP request is
+                     aborted in the browser and recorded as a finding ("would have
+                     sent: POST /api/thing"), service workers are blocked, and
+                     WebSocket messages are dropped. This blocks HTTP methods and
+                     channels, not server mutation (a GET endpoint with side effects
+                     still runs). 0 = real writes are allowed
   UAT_CONTRACT_MAP   path to a JSON axe-rule -> contract-clause map
                      (otherwise ./contract-map.json next to the driver)
   UAT_MAX_ELEMENTS   max interactive elements exercised per pass per viewport (default 20)
@@ -49,9 +52,12 @@ reported, never turned into a silent pass/fail -- read the report.
 NOTE: this really clicks, types into, and submits forms on whatever URL you give it.
 Point it at a local dev server or a built static site, never at a page you can't afford
 to be clicked on for real (e.g. a production form that emails someone, a live payment
-flow). Read-only mode (the default) stops the *requests* those clicks cause from leaving
-the browser, but the clicks, typing and navigation are still real -- UAT_READONLY=0
-turns the guard off entirely, so only use that against something you can mutate.
+flow). Read-only mode (the default) stops the *non-GET HTTP requests* those clicks
+cause from leaving the browser (service workers are blocked and WebSocket messages
+are dropped), but the clicks, typing and navigation are still real, and a GET with
+side effects still runs -- read-only blocks methods/channels, not server mutation.
+UAT_READONLY=0 turns the guard off entirely, so only use that against something you
+can mutate.
 """
 import json
 import os
@@ -173,8 +179,11 @@ def run_one(url: str, out_dir: Path) -> int:
     problems = [f for f in findings if f["level"] == "problem"]
     notes = [f for f in findings if f["level"] == "note"]
     if ro.get("on", False):
-        print(f"  READ-ONLY MODE ON: {ro.get('blockedWrites', 0)} non-GET request(s) blocked in the browser "
-              f"-- nothing was written to the target (UAT_READONLY=0 allows real writes)")
+        np = report.get("networkPolicy", {})
+        print(f"  READ-ONLY MODE ON: {ro.get('blockedWrites', 0)} non-GET HTTP method(s) blocked; "
+              f"{np.get('blockedWebSocketMessages', 0)} WebSocket message(s) dropped; service workers blocked "
+              f"-- this blocks methods/channels, it does NOT prove the server was protected from mutation "
+              f"(UAT_READONLY=0 allows real writes)")
     else:
         print("  read-only OFF (UAT_READONLY=0): real writes were allowed and may have reached the target")
     print(f"  real mouse clicks tried: {counts.get('mouseClicksTried', 0)} | real touch taps tried: {counts.get('touchTapsTried', 0)} "

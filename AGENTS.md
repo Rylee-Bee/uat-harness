@@ -62,8 +62,10 @@ read-only notes (`would have sent: POST …`).
    uploaded files. Found by a canary test; load-bearing like rule 2.
 4. **Findings are never pass/fail.** Only an unreachable page (or unresolvable deps) exits
    non-zero. Do not add a threshold that turns findings into an exit code.
-5. **Read-only stays the default** (`UAT_READONLY` unset/1 aborts every non-GET). Never point
-   this at live mutating endpoints; `UAT_READONLY=0` only for targets you may mutate.
+5. **Read-only stays the default** (`UAT_READONLY` unset/1 aborts every non-GET HTTP
+   request, blocks service workers, and drops WebSocket messages). This blocks
+   methods/channels, not server mutation; never point this at live mutating endpoints;
+   `UAT_READONLY=0` only for targets you may mutate.
 6. **`@playwright/test` and `axe-core` stay in `dependencies`, not `devDependencies`** —
    consumers install this repo as a package (`npm install github:Rylee-Bee/uat-harness`), and
    npm skips a dependency's devDependencies.

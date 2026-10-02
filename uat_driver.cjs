@@ -6,14 +6,18 @@
 // page.keyboard, and axe-core checks real WCAG rules, mapped to contract clauses via
 // contract-map.json (or $UAT_CONTRACT_MAP).
 //
-// Safety: read-only is ON by default (UAT_READONLY unset or 1). Every non-GET request is aborted at
-// the network layer and recorded as a finding ("would have sent: POST /api/thing") so the run can
-// never mutate anything behind the URL. Set UAT_READONLY=0 to allow real writes.
+// Safety: read-only is ON by default (UAT_READONLY unset or 1). Every non-GET
+// HTTP request is aborted at the network layer and recorded as a finding
+// ("would have sent: POST /api/thing"). Service workers are blocked and, in
+// read-only mode, WebSocket messages are captured and never forwarded. This
+// blocks HTTP *methods* (plus SW/WS channels); it does NOT prove the server
+// was protected from every mutation -- a GET endpoint with side effects still
+// runs. Set UAT_READONLY=0 to allow real writes.
 "use strict";
 const fs = require("fs");
 const path = require("path");
 const { buildAuthAllowlist, isApprovedOrigin, decideRequest, normalizeOrigin, safePath } = require("./lib/policy.cjs");
-const { installRequestPolicy } = require("./lib/netpolicy.cjs");
+const { installRequestPolicy, installWebSocketPolicy } = require("./lib/netpolicy.cjs");
 
 // ---- Dependency resolution -------------------------------------------------------------------
 // This repo is standalone: no hardcoded sibling project's node_modules. Resolution order:
@@ -126,7 +130,9 @@ const consumeBlocked = () => {
   blockedAttributed = blocked.length;
   return delta;
 };
-const fmtBlocks = (ds) => ds.map((b) => `${b.method} ${b.path}`).join(", ");
+const fmtBlocks = (ds) => ds.map((b) => b.kind === "websocket"
+  ? `WebSocket message (${b.bytes} bytes) to ${b.path}`
+  : `${b.method} ${b.path}${b.reason && !/read-only/.test(b.reason) ? ` [${b.reason}]` : ""}`).join(", ");
 
 function slug(s) {
   return String(s).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 60) || "el";
@@ -153,6 +159,10 @@ async function installNetworkPolicy(ctx) {
     readOnly,
     onBlock: recordBlock,
   });
+  // E02: context routing does not see WebSocket traffic. In read-only mode the
+  // handshake is intercepted and never connected to the server, so page->server
+  // messages are recorded and dropped -- a write can never be forwarded.
+  await installWebSocketPolicy(ctx, { readOnly, onBlock: recordBlock });
 }
 
 async function inventory(page, sel) {
@@ -181,6 +191,7 @@ async function domSignature(page) {
 
 function writeMarkdownReport(outDir, report) {
   const ro = report.readOnly || { on: false, blockedWrites: 0 };
+  const wsBlocked = (report.networkPolicy && report.networkPolicy.blockedWebSocketMessages) || 0;
   const cov = report.coverage || {};
   const problems = report.findings.filter((f) => f.level === "problem");
   const notes = report.findings.filter((f) => f.level === "note");
@@ -194,7 +205,7 @@ function writeMarkdownReport(outDir, report) {
   L.push(`| URL | ${report.url} |`);
   L.push(`| Run at | ${report.at} |`);
   L.push(ro.on
-    ? `| Read-only mode | **ON — every non-GET request was aborted in the browser and recorded below (${ro.blockedWrites} blocked). Nothing was written to the target.** |`
+    ? `| Read-only mode | **ON — blocked HTTP methods: ${ro.blockedWrites} non-GET request(s) aborted in the browser; service workers blocked; WebSocket messages dropped: ${wsBlocked}. This blocks the listed HTTP methods and channels — it does NOT prove the server was protected from mutation (a GET endpoint with side effects still runs).** |`
     : `| Read-only mode | **OFF (UAT_READONLY=0) — real writes were allowed and may have reached the target.** |`);
   L.push(`| Findings | ${problems.length} PROBLEM, ${notes.length} note |`);
   L.push(`| Real interactions | ${report.counts.mouseClicksTried} mouse clicks, ${report.counts.touchTapsTried} touch taps, ${report.counts.formsFilled} form(s) filled, ${report.counts.undersizedTargets} undersized (<44px) target(s) |`);
@@ -211,7 +222,7 @@ function writeMarkdownReport(outDir, report) {
   L.push("- **Not pass/fail.** Findings are never turned into a verdict; only an unreachable page makes the run exit non-zero. Read the findings, don't read the exit code.");
   L.push("- **State-change detection is a heuristic.** \"Did clicking this do anything\" compares the page URL and `document.body.innerHTML.length` before/after. It can false-positive \"did nothing\" on a same-page link that is *supposed* to do nothing, and it can miss a style-only change, an equal-length string change, or anything rendered in a canvas/shadow DOM.");
   L.push("- **Bounded coverage.** Only the first `UAT_MAX_ELEMENTS` visible interactive elements per pass, two viewports, and two axe scans. A clean run is not proof there is nothing left to find — open a trace or a screenshot before calling a page done.");
-  if (ro.on) L.push("- **Read-only mode proves nothing about the server side.** \"would have sent\" means the browser was stopped before the request left; no write path was exercised, no server response was validated.");
+  if (ro.on) L.push("- **Read-only mode blocks HTTP methods and channels, not mutations.** \"would have sent\" means the browser was stopped before the request left; a `GET` endpoint with side effects still runs, service workers are blocked (so their requests never happen), and WebSocket messages are dropped. No write path was exercised and no server response was validated.");
   L.push("- **Form results are not validated for correctness** — only whether something visibly changed after a real submit click.");
   L.push("");
   fs.writeFileSync(path.join(outDir, "report.md"), L.join("\n"));
@@ -258,7 +269,7 @@ async function main() {
   // ---------------- Desktop pass: load, console/network, images, real mouse clicks, forms, axe --
   const desktopVideoDir = path.join(outDir, "video-desktop");
   fs.mkdirSync(desktopVideoDir, { recursive: true });
-  const desktopCtx = await browser.newContext({ viewport: { width: 1280, height: 900 }, recordVideo: { dir: desktopVideoDir } });
+  const desktopCtx = await browser.newContext({ viewport: { width: 1280, height: 900 }, recordVideo: { dir: desktopVideoDir }, serviceWorkers: "block" });
   await installNetworkPolicy(desktopCtx);
   await desktopCtx.tracing.start({ screenshots: true, snapshots: true, sources: true });
   const page = await desktopCtx.newPage();
@@ -482,7 +493,7 @@ async function main() {
   where = "interactive elements (touch)";
   const mobileVideoDir = path.join(outDir, "video-mobile");
   fs.mkdirSync(mobileVideoDir, { recursive: true });
-  const mobileCtx = await browser.newContext({ ...devices["iPhone 13"], recordVideo: { dir: mobileVideoDir } });
+  const mobileCtx = await browser.newContext({ ...devices["iPhone 13"], recordVideo: { dir: mobileVideoDir }, serviceWorkers: "block" });
   await installNetworkPolicy(mobileCtx);
   await mobileCtx.tracing.start({ screenshots: true, snapshots: true, sources: true });
   const mpage = await mobileCtx.newPage();
@@ -573,13 +584,24 @@ async function main() {
 
   // Any write blocked outside a click/submit (background timers, autosave) still gets reported.
   for (const b of blocked.slice(blockedAttributed)) {
-    add("note", "network (read-only)", `request blocked by read-only mode, would have sent: ${b.method} ${b.path}`);
+    add("note", "network (read-only)", `blocked in the browser, would have sent: ${fmtBlocks([b])}`);
   }
   blockedAttributed = blocked.length;
 
+  const httpBlocked = blocked.filter((b) => b.kind !== "websocket").length;
+  const wsBlockedCount = blocked.filter((b) => b.kind === "websocket").length;
   const report = {
     url, ok: true, at: new Date().toISOString(),
-    readOnly: { on: readOnly, blockedWrites: blocked.length },
+    readOnly: { on: readOnly, blockedWrites: httpBlocked },
+    networkPolicy: {
+      readOnly,
+      authenticatedOriginsCount: AUTH_ALLOWLIST.length,
+      authScopedToAllowlist: AUTH_ALLOWLIST.length > 0,
+      serviceWorkers: "block",
+      blockedHttpMethods: httpBlocked,
+      blockedWebSocketMessages: wsBlockedCount,
+      note: "read-only blocks non-GET HTTP methods, blocks service workers, and drops WebSocket messages; it does not prevent mutations caused by GET side effects",
+    },
     findings, counts, coverage,
     screenshots: { desktop: "desktop.png", mobile: "mobile.png" },
     traces: { desktop: "trace-desktop.zip", mobile: "trace-mobile.zip" },
