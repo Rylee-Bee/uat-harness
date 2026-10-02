@@ -160,7 +160,7 @@ function recordBlock(b) {
 // Replaces the old context-wide `extraHTTPHeaders` token and the old
 // non-GET-only route.
 async function installNetworkPolicy(ctx) {
-  await installRequestPolicy(ctx, {
+  const policy = await installRequestPolicy(ctx, {
     allowlist: AUTH_ALLOWLIST,
     token: AUTH_TOKEN,
     readOnly,
@@ -170,6 +170,7 @@ async function installNetworkPolicy(ctx) {
   // handshake is intercepted and never connected to the server, so page->server
   // messages are recorded and dropped -- a write can never be forwarded.
   await installWebSocketPolicy(ctx, { readOnly, onBlock: recordBlock });
+  return policy;
 }
 
 // E03: redact staging, then promote into OUT_DIR. Throws (after deleting
@@ -317,9 +318,10 @@ async function main() {
   const desktopVideoDir = path.join(STAGE_DIR, "video-desktop");
   fs.mkdirSync(desktopVideoDir, { recursive: true });
   const desktopCtx = await browser.newContext({ viewport: { width: 1280, height: 900 }, recordVideo: { dir: desktopVideoDir }, serviceWorkers: "block" });
-  await installNetworkPolicy(desktopCtx);
+  const desktopPolicy = await installNetworkPolicy(desktopCtx);
   await desktopCtx.tracing.start({ screenshots: true, snapshots: true, sources: true });
   const page = await desktopCtx.newPage();
+  await desktopPolicy.attachPage(page);
   let where = "load";
   page.on("console", (m) => { if (m.type() === "error") add("problem", where, `Console error: ${m.text().slice(0, 300)}`); });
   page.on("pageerror", (e) => add("problem", where, `Page crashed: ${e.message.slice(0, 300)}`));
@@ -539,9 +541,10 @@ async function main() {
   const mobileVideoDir = path.join(STAGE_DIR, "video-mobile");
   fs.mkdirSync(mobileVideoDir, { recursive: true });
   const mobileCtx = await browser.newContext({ ...devices["iPhone 13"], recordVideo: { dir: mobileVideoDir }, serviceWorkers: "block" });
-  await installNetworkPolicy(mobileCtx);
+  const mobilePolicy = await installNetworkPolicy(mobileCtx);
   await mobileCtx.tracing.start({ screenshots: true, snapshots: true, sources: true });
   const mpage = await mobileCtx.newPage();
+  await mobilePolicy.attachPage(mpage);
   mpage.on("console", (m) => { if (m.type() === "error") add("problem", where, `Console error (mobile): ${m.text().slice(0, 300)}`); });
   try {
     await mpage.goto(url, { waitUntil: "load", timeout: 20000 });
