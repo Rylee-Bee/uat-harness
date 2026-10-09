@@ -39,8 +39,8 @@ payment flow, or anything you cannot afford to be clicked on for real.
 
 ## Where to read more
 
-- [`AGENTS.md`](AGENTS.md) — how the driver works: environment variables, what it writes, its
-  tests, and which file to open for which change.
+- [`AGENTS.md`](AGENTS.md) — the rules it keeps: read-only default, redaction before promotion,
+  findings never gating. Commands, env vars, outputs and file map: [`docs/agent-reference.md`](docs/agent-reference.md).
 - [`uat.py`](uat.py) — the entry point. Run it with no arguments for usage.
 - [`contract-map.json`](contract-map.json) — axe-core rule ids mapped to plain-words contract
   clauses.
