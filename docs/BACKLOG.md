@@ -11,7 +11,7 @@ first, whatever its size.
 
 ### #5 — Research: domain player drivers as replayable UAT evidence, without making UAT a game framework
 
-- Issue: https://github.com/Rylee-Bee/uat-harness/issues/5
+- Issue: https://github.com/rylee-bee-labs/uat-harness/issues/5
 - Opened: 2026-10-06 · Labels: none
 - Status on 2026-10-07: closed as not planned on 2026-10-07 — tracked here
 

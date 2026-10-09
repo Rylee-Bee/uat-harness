@@ -6,7 +6,7 @@ real (Playwright), runs axe-core, and writes findings a human reads. "For real" 
 iPhone-13 emulation and `page.keyboard` typing into real forms — not a `locator.click()` smoke
 script. Two axe-core scans (desktop + mobile) mapped to contract clauses, plus full-page
 screenshots, traces and videos for both passes. **Public repo**
-(`github.com/Rylee-Bee/uat-harness`) — everything tracked must be safe to publish.
+(`github.com/rylee-bee-labs/uat-harness`) — everything tracked must be safe to publish.
 
 Owns: the driver, its contract map, and the persona/journey/acceptance templates. Does not own:
 any repo's own Playwright suite (that suite stays the gate for its repo), or CI wiring (that
@@ -161,7 +161,7 @@ is nothing left to find. Open a trace or a screenshot before calling a page done
    methods/channels, not server mutation; never point this at live mutating endpoints;
    `UAT_READONLY=0` only for targets you may mutate.
 6. **`@playwright/test` and `axe-core` stay in `dependencies`, not `devDependencies`** —
-   consumers install this repo as a package (`npm install github:Rylee-Bee/uat-harness`), and
+   consumers install this repo as a package (`npm install github:rylee-bee-labs/uat-harness`), and
    npm skips a dependency's devDependencies.
 7. **Public-safe tracked files.** No secrets, tokens, hostnames, real ports, LAN IPs, deployment
    topology, or absolute machine paths. Examples use `http://127.0.0.1:PORT/...` literally;
