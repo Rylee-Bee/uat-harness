@@ -1,6 +1,6 @@
 # Domain drivers and replayable UAT evidence
 
-Status: research for [#5](https://github.com/Rylee-Bee/uat-harness/issues/5)  
+Status: research for [#5](https://github.com/rylee-bee-labs/uat-harness/issues/5)  
 Date: 2026-10-06  
 Origin: Rylee and Sol worked this through together while designing VEFR's Player Driver / Pass-the-Controller work.
 
